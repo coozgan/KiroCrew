@@ -19,6 +19,19 @@ _MAX_EPISODIC_PER_CONSOLIDATION = 10
 # lessons array could occupy a worker thread for minutes.
 _MAX_LESSONS_PER_CONSOLIDATION = 10
 
+# Canonical join between a lesson's rule and its NOT-clause. Lives in this
+# dependency-free module for the same reason as the injection patterns below:
+# ``write_lesson`` writes this format and readers (the dashboard's enrich-in-place
+# path in ``dashboard/handlers/cron``) split on it, but that handler package must
+# stay a boot-path leaf -- importing ``vector_memory`` there would pull
+# snowballstemmer plus the optional numpy/faiss deps (~175ms), which
+# ``test_perf_boot_path::test_memory_handler_does_not_import_vector_memory``
+# forbids. Keeping it here lets both sides use a plain TOP-LEVEL import (no lazy
+# import, satisfying the ``top-level-imports`` rule) while the format still has
+# exactly one spelling. ``vector_memory`` re-exports it, so existing import paths
+# stay valid.
+LESSON_NEGATIVE_SEP = " — NOT: "
+
 # Prompt-injection detection patterns. Kept in this dependency-free module (not
 # in ``vector_memory``, whose numpy/faiss/snowballstemmer imports are heavy) so
 # prompt-building callers such as ``security.contains_injection`` can screen

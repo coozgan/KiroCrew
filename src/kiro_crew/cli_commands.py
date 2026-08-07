@@ -53,6 +53,7 @@ from kiro_crew.eval.runner import EvalRunner, format_results, score_by_dimension
 from kiro_crew.eval.scenario import AssertionType, load_scenario, load_scenarios
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.learn import Lesson, LessonStore
+from kiro_crew.mcp_core import _resolve_session_key
 from kiro_crew.security import (
     BUILTIN_DENY_PATTERNS,
     is_sensitive_path,
@@ -1290,6 +1291,114 @@ async def _run_eval(args: argparse.Namespace) -> None:
     print(f"\nResults saved to:\n  {report_path}\n  {json_path}")
 
 
+def _gateway_add_lesson(
+    rule: str, category: str, negative: str | None = None
+) -> tuple[bool, str | None]:
+    """Best-effort: have a RUNNING gateway write the lesson so it gets embedded.
+
+    The CLI deliberately never loads the 610MB GGUF itself -- ``make_sync_embed_fn``
+    is non-blocking and returns None until the model is resident, so a one-shot
+    process would either pay a full model load on every invocation or persist
+    embedding=NULL (invisible to vector retrieval; keyword-only at weight 0.4 in
+    hybrid search). Delegating puts the write in the process that already holds the
+    model, which additionally runs ``write_lesson``'s >0.85-cosine semantic dedup
+    and a background contradiction sweep -- both of which a vector-less local write
+    silently skips.
+
+    Returns ``(ok, refusal)``:
+
+    * ``(True, None)``  -- the gateway accepted and embedded the write.
+    * ``(False, None)`` -- the gateway was never REACHED, and no request was sent
+      (not running, stale ``dashboard.url``, no resolvable session key, health probe
+      failed). The write provably did not happen, so the caller safely degrades to
+      an unembedded local write plus a warning.
+    * ``(False, "<detail>")`` -- the request WAS sent and the write must NOT be
+      retried locally. Two cases: the gateway answered and refused (e.g. 409 because
+      an existing lesson already covers this rule), or the response was lost so the
+      outcome is UNKNOWN and a local write could duplicate a committed lesson.
+      Either way the caller surfaces the detail instead of writing again.
+
+    The pre-send / post-send split is the important one: only the pre-send case is
+    safe to retry, because only there is it certain nothing was persisted.
+
+    ponytail: no retry/backoff. Best-effort by design; the local write is the
+    fallback, so an unhealthy gateway costs at most the 2s probe + 10s post.
+    """
+    try:
+        cfg = KiroCrewConfig.load()
+        _host, port = parse_dashboard_url(cfg.dashboard.url)
+        secret = (config_dir() / ".local_secret").read_text().strip()
+    except Exception:
+        return False, None
+    if not secret:
+        return False, None
+    # POST /api/lessons rejects anonymous writes (400 "missing X-Session-Key") and
+    # validates the key against live slots / restricted keys / persisted history.
+    # Reuse the hardened resolver (env var, then PID-file ancestor walk) rather than
+    # sending the UI's literal "dashboard:ui" -- impersonating it would misattribute
+    # the write in the security event log. A plain terminal has no session, so it
+    # correctly falls through to the local path.
+    try:
+        session_key = _resolve_session_key()
+    except Exception:
+        session_key = os.environ.get("KIROCREW_SESSION_KEY", "")
+    if not session_key:
+        return False, None
+    base = f"http://localhost:{port}"
+    try:  # liveness probe first: a dead port fails in ms, so the CLI never stalls
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- the host is the literal loopback name and the path is a fixed constant; only the PORT varies, and it comes from local config via parse_dashboard_url. Nothing agent- or request-controlled reaches urlopen. Same trust profile as the mcp_core loopback posts.  # noqa: E501
+        with urllib.request.urlopen(f"{base}/api/health", timeout=2) as resp:
+            if resp.status != 200:
+                return False, None
+    except Exception:
+        return False, None
+    body: dict[str, str] = {"rule": rule, "category": category}
+    if negative:
+        body["negative"] = negative
+    req = urllib.request.Request(
+        f"{base}/api/lessons",
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "X-Internal-Secret": secret,
+            "X-Session-Key": session_key,
+        },
+        method="POST",
+    )
+    try:
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- see the health-probe justification above; same loopback base  # noqa: E501
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status not in (200, 201):
+                return False, None
+            payload = json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        # The gateway answered and REFUSED (e.g. 409 when an existing lesson already
+        # covers this rule, so the NOT-clause was not stored). That is a real verdict,
+        # not an unreachable gateway -- surface it instead of falling back to a local
+        # write, which would hit the same dedup and print "Saved:" for nothing.
+        try:
+            body = json.loads(exc.read() or b"{}")
+            detail = body.get("detail") or body.get("error") or f"HTTP {exc.code}"
+        except Exception:
+            detail = f"HTTP {exc.code}"
+        return False, str(detail)
+    except Exception as exc:
+        # The request WAS sent (the health probe above already proved the port is
+        # live), so a failure here -- read timeout, connection reset mid-response --
+        # leaves the outcome UNKNOWN: the gateway may well have committed the lesson
+        # and only the response was lost. Falling back to a local write would then
+        # duplicate it. Report the ambiguity and let the operator re-check rather
+        # than guessing; treat it as a refusal so the caller does NOT write again.
+        return False, (
+            f"the gateway accepted the request but the outcome is unknown ({exc}). "
+            "The lesson may already be saved -- check `kirocrew learn list` before "
+            "retrying, to avoid writing it twice."
+        )
+    if isinstance(payload, dict) and payload.get("error"):
+        return False, str(payload.get("detail") or payload["error"])
+    return True, None
+
+
 def _learn(args: argparse.Namespace) -> None:
     """Save, list, or remove learned corrections."""
 
@@ -1304,9 +1413,43 @@ def _learn(args: argparse.Namespace) -> None:
             rule = args.rule
             category = args.category
             negative = getattr(args, "negative", None)
-            if vs.write_lesson(rule, category, negative):
-                neg = f" ({negative})" if negative else ""
+            neg = f" ({negative})" if negative else ""
+            # Best-effort embedding: delegate to a running gateway, which holds the
+            # model resident; otherwise write locally WITHOUT a vector and say so.
+            # Delegation is unconditional -- the REST route now passes ``negative``
+            # through to write_lesson (it previously hardcoded None and dropped the
+            # clause), so nothing is lost by preferring the embedded path.
+            ok, refusal = _gateway_add_lesson(rule, category, negative)
+            if ok:
+                print(f"Saved: {rule}{neg} [{category}] (embedded via gateway)")
+            elif refusal is not None:
+                # The gateway ANSWERED and refused (an existing lesson already covers
+                # this rule, so the clause was not stored). Falling back to a local
+                # write would hit the same dedup and print "Saved:" for a lesson that
+                # never landed -- exactly the silent drop this change exists to end.
+                print(f"Not saved: {refusal}", file=sys.stderr)
+                raise SystemExit(1)
+            elif vs.write_lesson(rule, category, negative):
+                print(
+                    "Warning: gateway not running -- saved WITHOUT an embedding, so "
+                    "this lesson will not be found by semantic search until it is "
+                    "backfilled.",
+                    file=sys.stderr,
+                )
                 print(f"Saved: {rule}{neg} [{category}]")
+            elif negative:
+                # The vector store refused (an existing lesson already covers this
+                # rule). Falling through to the JSONL store would print "Saved:" while
+                # the clause is invisible to every vector-backed reader -- listing and
+                # context injection both read the vector store when it is available.
+                # Report the drop rather than manufacture a success.
+                print(
+                    "Not saved: an existing lesson already covers this rule, so the "
+                    "NOT-clause was not stored. Submit the negative against the exact "
+                    "text of the existing lesson, or remove that lesson first.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
             else:
                 lesson = Lesson(
                     ts=datetime.now(timezone.utc).isoformat(),

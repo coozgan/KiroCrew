@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 try:
@@ -120,6 +121,54 @@ class LessonStore:
             )
             self._cache = None  # invalidate
         logger.info("Saved lesson: %s", lesson.rule)
+
+    def enrich_negative(self, rule: str, negative: str) -> bool:
+        """Attach *negative* to the record whose rule matches *rule* exactly.
+
+        Replaces the field IN PLACE with a SINGLE atomic write (tmp + ``os.replace``),
+        so there is no window in which the original is gone and the replacement has
+        not landed. The previous handler-side approach was ``remove()`` then
+        ``save()``: a crash between the two lost the lesson outright, and ``remove()``
+        matches by SUBSTRING so it could also take out an unrelated superset record.
+
+        Matching is case-insensitive via ``casefold()`` (not ``lower()``): ``lower()``
+        leaves ``ß`` alone, so a stored "Straße" and a submitted "STRASSE" compare
+        unequal, enrichment misses, and ``save()`` -- whose duplicate check has the
+        same weakness -- then persists a second copy of the same lesson.
+
+        Returns True when a record already carried this clause or was enriched, so the
+        caller can skip ``save()``. Returns False when no exact match exists.
+        """
+        with self._lock:
+            lessons = self.load_all()
+            wanted = rule.casefold().strip()
+            # Build a REPLACEMENT list rather than mutating the records in place:
+            # load_all() hands back the cached list, so an in-place edit followed by a
+            # failed write (tmp write or os.replace raising) would leave the cache
+            # advertising a clause that was never persisted -- and that cache feeds
+            # future context injection. Nothing is mutated until the write succeeds.
+            updated: list[Lesson] = []
+            hit = False
+            for le in lessons:
+                if not hit and le.rule.casefold().strip() == wanted:
+                    hit = True
+                    if le.negative == negative:
+                        return True  # already carries this clause; nothing to write
+                    updated.append(replace(le, negative=negative))
+                    continue
+                updated.append(le)
+            if not hit:
+                return False
+            self._dir.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+            tmp.write_text(
+                "".join(json.dumps(asdict(le)) + "\n" for le in updated),
+                encoding="utf-8",
+            )
+            os.replace(tmp, self._path)
+            self._cache = None  # invalidate
+        logger.info("Enriched lesson with a NOT-clause: %s", rule)
+        return True
 
     def remove(self, rule_substring: str) -> bool:
         """Remove lessons whose rule contains *rule_substring*. Returns True if any removed."""
