@@ -31,6 +31,25 @@ MCP", "captured with agent-browser", "scripted Playwright via pod-e2e" — so th
 knows whether they could have watched it happen, and never imply a panel stream that
 didn't occur.
 
+> **Keep every frame you read under 2000px on both edges.** A single image past
+> that wedges the session permanently: the provider rejects the WHOLE request once
+> a conversation carries many images, kiro-cli replays the full history every
+> turn, and the offending block sits at a fixed history index that nothing can
+> evict — the same error re-fires on every later turn no matter what you do next.
+> So capture at `deviceScaleFactor: 1` (a 1400-1500px viewport reads fine), and
+> prefer an element screenshot over `fullPage` on a long page. If a file is
+> already oversized, downscale it BEFORE reading it — Kiro Crew's own venv ships
+> Pillow, and this resolves it on any install (`python3` only resolves the path;
+> `readlink -f` is GNU-only and would exit 127 on macOS):
+>
+> ```bash
+> PY="$(python3 -c 'import os,shutil;print(os.path.join(os.path.dirname(os.path.realpath(shutil.which("kirocrew"))),"python"))')"
+> "$PY" -c "from PIL import Image; p='/abs/path/shot.png'; im=Image.open(p); im.thumbnail((2000,2000)); im.save(p)"
+> ```
+>
+> The error is asymmetric, which is why the cap is not a nicety: downscaling only
+> costs detail, while one oversized read costs the rest of the conversation.
+
 ## Precondition — a browser must actually be available (the guard)
 
 `browser_navigate` / `browser_take_screenshot` come from the external
