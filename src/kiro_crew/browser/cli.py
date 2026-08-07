@@ -74,10 +74,15 @@ Commands:
   extension off        Disable extension mode (use separate headless Chromium)
 
 Modes:
-  Extension mode (recommended for macOS): Playwright controls your real Chrome
-    with all existing auth — no cookie injection needed. Requires the Playwright
-    Chrome extension: https://chromewebstore.google.com/detail/mmlmfjhmonkocbjadbfplnigmagldckm
-  Headless mode (default on Linux): Launches separate Chromium.
+  Extension mode (recommended for macOS): Playwright controls your real
+    Chromium-based browser (Chrome, Edge, Brave, Arc, Opera) with all existing
+    auth — no cookie injection needed. Requires the Playwright MCP Bridge
+    extension:
+      Chrome/Brave/Arc/Opera: https://chromewebstore.google.com/detail/mmlmfjhmonkocbjadbfplnigmagldckm
+      Edge:                    https://microsoftedge.microsoft.com/addons/detail/dnkbmbbmelcnhkfobbceecgnjbnaocgk
+  Headless mode (default on Linux): Playwright launches its own browser. The
+    engine (chromium/firefox/webkit) is chosen in Settings → Browser; firefox
+    and webkit are Playwright's own builds, not your installed Firefox/Safari.
 """
     )
 
@@ -119,9 +124,9 @@ def _cmd_setup() -> None:
         print("Action needed — install the Playwright MCP package, then re-run this:")
         print("  npm install -g @playwright/mcp        # or: npx @playwright/mcp\n")
     print("Restart the gateway to apply:   kirocrew stop && kirocrew gateway\n")
-    print("The Browser panel is a read-only live mirror (view-only). Toggle")
-    print('the Globe ("Let the agent use the browser") to let the agent operate')
-    print("the page.")
+    print("Turn on Browser Mode in Settings → Browser (or the dashboard prompt).")
+    print("Once it is on, the agent operates the browser directly — the Browser")
+    print("panel shows a read-only live mirror of what it is doing.")
 
 
 def _cmd_extension(action: str) -> None:
@@ -132,13 +137,16 @@ def _cmd_extension(action: str) -> None:
     token_file = kirocrew_dir / "playwright-extension-token"
 
     if action == "on":
-        print("Playwright Chrome Extension Setup")
+        print("Playwright MCP Bridge Extension Setup")
         print("=" * 40)
         print()
-        print("1. Install the extension from Chrome Web Store:")
-        print("   https://chromewebstore.google.com/detail/mmlmfjhmonkocbjadbfplnigmagldckm")
+        print("1. Install the extension for your Chromium-based browser:")
+        print("   Chrome/Brave/Arc/Opera: "
+              "https://chromewebstore.google.com/detail/mmlmfjhmonkocbjadbfplnigmagldckm")
+        print("   Edge:                    "
+              "https://microsoftedge.microsoft.com/addons/detail/dnkbmbbmelcnhkfobbceecgnjbnaocgk")
         print()
-        print("2. Click the extension icon in Chrome to see your connection token.")
+        print("2. Click the extension icon in your browser to see the connection token.")
         print("   It looks like: PLAYWRIGHT_MCP_EXTENSION_TOKEN=xxxxx...")
         print()
         token = input("3. Paste your extension token here: ").strip()
