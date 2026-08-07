@@ -35,6 +35,7 @@ from kiro_crew.slack.handler import (
     _hydrate_conv_flags,
     _hydrate_thread_overrides,
     _is_slack_restricted,
+    _resume_if_paused,
     _should_auto_approve_spawn,
     _thread_agents,
     get_dashboard_state,
@@ -184,6 +185,7 @@ async def handle_message_transport(
             _hydrate_thread_overrides(session_key, conversation_log)
             _hydrate_conv_flags(sessions, session_key)
         linked_session_key = owner
+        _resume_if_paused(sessions, owner, reply_ts)
 
     _resolve_thread_owner("inbound")
 

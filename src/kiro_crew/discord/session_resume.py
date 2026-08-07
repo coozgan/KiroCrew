@@ -144,6 +144,42 @@ class DiscordSessionResume:
             )
         return None
 
+    def resume_if_muted(self, channel_id: str, key: str) -> bool:
+        """A reply in a MUTED conversation lifts the mute, like a Slack thread reply.
+
+        Disconnect retains the binding and its inbound marker, so a reply here
+        still resolves to *key*. Without this, that reply reached the session and
+        the answer was swallowed by the outbound gate: the conversation looked dead
+        while silently consuming input, and the dashboard answered someone who was
+        typing in Discord. Slack has always lifted its pause on a thread reply
+        (``slack.handler._resume_if_paused``); this is the same rule for channels,
+        so a user who learns one is not wrong about the other.
+
+        Deliberately no history re-seed: the user is reading this conversation
+        right now, so replaying it here would be noise. Explicit dashboard
+        Connect is the path that catches up.
+
+        Guarded on the READ so the blocking ``_save`` inside ``set_mirror_paused``
+        runs once, on the mute→live transition, and never on a reply to a live
+        binding. ``is True`` because a stubbed SessionManager returns a truthy
+        Mock, which would otherwise "resume" a binding that was never muted.
+        """
+        channel_type = self.link_for(channel_id).channel_type
+        try:
+            if self.sessions.is_mirror_paused(key, channel_type) is True:
+                self.sessions.set_mirror_paused(key, False, channel_type)
+                logger.info(
+                    "▶️ %s conversation %s resumed by reply — was muted",
+                    channel_type,
+                    channel_id,
+                )
+                return True
+        except Exception:
+            logger.debug(
+                "could not resume muted %s binding for %s", channel_type, key, exc_info=True
+            )
+        return False
+
     def leave_resumed_session(self, channel_id: str) -> str | None:
         key = self.resumed_session(channel_id)
         if key is not None:

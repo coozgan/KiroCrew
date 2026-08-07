@@ -903,6 +903,29 @@ def _get_default_agent() -> str:
     return _cached_default_agent
 
 
+def _resume_if_paused(sessions: object, owner: str, reply_ts: str) -> None:
+    """A reply in a paused thread resumes the session that owns it.
+
+    Pause retains the thread binding, both coordinate fields and the reverse
+    index, so there is nothing to re-bind here -- lifting the flag is the whole
+    resume. That is exactly what separates pause from unlink: after an unlink the
+    index is gone and this reply would mint a new session instead.
+
+    Deliberately no history re-seed. The user is reading this thread right now,
+    so re-posting the conversation into it would be noise; explicit dashboard
+    Reconnect is the path that re-seeds.
+
+    Guarded on the read so the blocking ``_save`` inside ``set_slack_paused``
+    runs once, on the resume transition, and never on replies to a live thread.
+    """
+    try:
+        if sessions.is_slack_paused(owner) is True:  # type: ignore[attr-defined]
+            sessions.set_slack_paused(owner, False)  # type: ignore[attr-defined]
+            logger.info("▶️ Slack thread %s resumed by reply — was paused", reply_ts)
+    except Exception:
+        logger.debug("could not resume paused slack link for %s", owner, exc_info=True)
+
+
 def _hydrate_thread_overrides(session_key: str, conversation_log: ConversationLog | None) -> None:
     """Populate in-memory caches from conversation log metadata if not already set."""
     if session_key in _hydrated_sessions:
@@ -2988,6 +3011,11 @@ async def handle_message(
             linked_session_key,
         )
         session_key = linked_session_key
+    # Outside the reroute branch on purpose: a Slack-BORN session resolves to its
+    # own key (no reroute) and can be paused just the same, so gating the resume
+    # on a key change would leave those threads muted forever.
+    if linked_session_key:
+        _resume_if_paused(sessions, linked_session_key, reply_ts)
 
     client: LLMProvider | None = None
     try:
