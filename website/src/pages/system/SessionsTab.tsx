@@ -26,7 +26,7 @@ import {
 } from '@tanstack/react-table'
 import { ChevronDown, ChevronRight, ChevronUp, MemoryStick, Columns3 } from 'lucide-react'
 import { api } from '../../api/client'
-import { Btn, Card, EmptyState, IconButton, SearchInput } from '../../components/ui'
+import { Btn, Card, ContentSkeleton, EmptyState, IconButton, SearchInput } from '../../components/ui'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../../components/ui/table'
 import InfoTip from '../../components/InfoTip'
 import SegmentedControl, { type Segment } from '../../components/SegmentedControl'
@@ -48,6 +48,20 @@ import { i18nT } from '../../i18n/t'
 import type { PlaneState, SessionsPlaneState } from '../SystemPage'
 
 type Payload = Awaited<ReturnType<typeof api.sessionsMemory>>
+
+/**
+ * Shared empty fallbacks for a payload that carries no rows yet.
+ *
+ * These MUST be stable references, not inline `?? []` literals. An inline literal
+ * mints a NEW array on every render, which changes the identity of `rows` (and so
+ * of the `data` handed to `useReactTable`) even though nothing about the content
+ * changed. TanStack reads a new `data` identity as "the data changed" and fires
+ * its auto-reset queue, which calls `setState` — re-rendering, minting another
+ * array, and looping. The window where it bites is any render with no `sessions`
+ * field at all: the first fetch, and an error payload such as a 403.
+ */
+const EMPTY_SESSIONS: Payload['sessions'] = []
+const EMPTY_TASKS: Payload['tasks'] = []
 
 /** Attribute the table folds on. `none` is a flat ranking, Task Manager's default. */
 export type GroupBy = 'none' | 'app' | 'agent' | 'channel'
@@ -132,14 +146,14 @@ export default function SessionsTab({ planeStateRef }: Props) {
     }
   }, [pickerOpen])
 
-  const { data } = useQuery<Payload>({
+  const { data, isPending } = useQuery<Payload>({
     queryKey: ['sessionsMemory'],
     queryFn: () => api.sessionsMemory(),
     refetchInterval: 5000,
   })
 
-  const sessions = data?.sessions ?? []
-  const tasks = data?.tasks ?? []
+  const sessions = data?.sessions ?? EMPTY_SESSIONS
+  const tasks = data?.tasks ?? EMPTY_TASKS
   const totals = data?.totals
   const unattributed = data?.unattributed ?? null
   const hostMb = totals?.host_mb ?? null
@@ -268,6 +282,14 @@ export default function SessionsTab({ planeStateRef }: Props) {
     getGroupedRowModel: getGroupedRowModel(),
     getExpandedRowModel: getExpandedRowModel(),
     autoResetExpanded: false,
+    // This table does not paginate — `getPaginationRowModel` is never supplied, so
+    // `pageIndex` / `pageSize` describe nothing. Auto-reset defaults to ON anyway,
+    // and with no `onPaginationChange` supplied it routes through TanStack's own
+    // `makeStateUpdater('pagination')`, i.e. `table.setState` → a React render.
+    // Paired with any change in `data` identity that becomes a render loop, since
+    // the render feeds the next auto-reset. Resetting a page index that cannot
+    // exist has no upside to trade against that, so it is off.
+    autoResetPageIndex: false,
     initialState: {
       expanded: true,
     },
@@ -355,7 +377,13 @@ export default function SessionsTab({ planeStateRef }: Props) {
         </div>
       </div>
 
-      {table.getRowModel().rows.length === 0 && !showUnattributed ? (
+      {isPending ? (
+        // "No active sessions" is a claim about the machine, and during the first
+        // fetch it is one we cannot make — a slow or failing endpoint made the page
+        // assert there were none while it was still asking. A skeleton says
+        // "not known yet", which is the truth.
+        <ContentSkeleton rows={6} />
+      ) : table.getRowModel().rows.length === 0 && !showUnattributed ? (
         <EmptyState
           icon={<MemoryStick className="lucide-inline" />}
           title={i18nT('pages.sessionsTab.no_active_sessions')}
